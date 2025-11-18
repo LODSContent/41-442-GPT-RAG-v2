@@ -7,8 +7,6 @@ function Write-Log($msg) {
 
 Write-Log "Script started in GitHub version."
 
-$AdminUserName  = $env:LAB_ADMIN_USERNAME
-$AdminPassword  = $env:LAB_ADMIN_PASSWORD
 $tenantId       = $env:LAB_TENANT_ID
 $subscriptionId = $env:LAB_SUBSCRIPTION_ID
 $clientId       = $env:LAB_CLIENT_ID
@@ -17,14 +15,17 @@ $labInstanceId  = $env:LAB_INSTANCE_ID
 $location       = $env:LAB_LOCATION
 if (-not $location) { $location = "eastus2" }
 
-if (-not $AdminUserName -or -not $AdminPassword -or -not $tenantId -or -not $subscriptionId -or -not $clientId -or -not $clientSecret -or -not $labInstanceId) {
+if (-not $tenantId -or -not $subscriptionId -or -not $clientId -or -not $clientSecret -or -not $labInstanceId) {
     Write-Log "[ERROR] One or more required environment variables are missing."
     return
 }
 
-$labCred = New-Object System.Management.Automation.PSCredential($AdminUserName, (ConvertTo-SecureString $AdminPassword -AsPlainText -Force))
-Connect-AzAccount -Credential $labCred | Out-Null
-Write-Log "Connected to Az using lab credentials."
+$secureSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
+$spCred = New-Object System.Management.Automation.PSCredential($clientId, $secureSecret)
+
+Connect-AzAccount -ServicePrincipal -Tenant $tenantId -Credential $spCred -Subscription $subscriptionId -SkipContextPopulation -ErrorAction Stop | Out-Null
+
+Write-Log "Connected to Azure using Service Principal authentication."
 
 $env:AZURE_CLIENT_ID     = $clientId
 $env:AZURE_CLIENT_SECRET = $clientSecret
