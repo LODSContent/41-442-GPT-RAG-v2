@@ -37,9 +37,7 @@ Write-Log "Starting azd auth login..."
 azd auth login --client-id $clientId --client-secret $clientSecret --tenant-id $tenantId | Out-Null
 Write-Log "Completed azd auth login."
 
-Write-Log "Starting az CLI login..."
-az login --service-principal --username $clientId --password $clientSecret --tenant $tenantId | Out-Null
-Write-Log "Completed az CLI login."
+# NOTE: Removed az login --service-principal to avoid hanging on large tenants
 
 $deployPath = "$HOME\gpt-rag-deploy"
 Write-Log "Cleaning deploy path: $deployPath"
@@ -113,7 +111,7 @@ if (Test-Path $openaiBicep) {
 azd env set AZURE_KEY_VAULT_NAME $newKvName | Out-Null
 azd env set AZURE_SUBSCRIPTION_ID $subscriptionId | Out-Null
 azd env set AZURE_LOCATION $location | Out-Null
-az account set --subscription $subscriptionId | Out-Null
+# az account set removed – Connect-AzAccount already set subscription context
 Write-Log "Configured azd env variables"
 
 azd env set AZURE_TAGS "LabInstance=$labInstanceId" | Out-Null
@@ -144,24 +142,27 @@ Write-Log "azd provision complete"
 
 # Assign Contributor role to service principal on the resource group
 try {
-    az role assignment create `
-        --assignee $clientId `
-        --assignee-principal-type ServicePrincipal `
-        --role "Contributor" `
-        --scope "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup" | Out-Null
+    New-AzRoleAssignment `
+        -ApplicationId $clientId `
+        -RoleDefinitionName "Contributor" `
+        -Scope "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup" | Out-Null
 
     Write-Log "Assigned Contributor role to service principal on resource group: $resourceGroup"
 } catch {
     Write-Log "[ERROR] Failed to assign Contributor role: $_"
 }
 
-$resourceGroup = az group list --query "[?contains(name, 'rg-dev-$labInstanceId')].name" -o tsv
+# Resolve resource group (matching original az query logic)
+$resourceGroup = (Get-AzResourceGroup |
+    Where-Object { $_.ResourceGroupName -like "*rg-dev-$labInstanceId*" } |
+    Select-Object -First 1).ResourceGroupName
 
 Write-Log "Checking for failed resources after provisioning..."
 
 # List any failed resources in the resource group
-$failedResources = az resource list --resource-group $resourceGroup `
-    --query "[?provisioningState=='Failed']" -o json | ConvertFrom-Json
+$failedResources = Get-AzResource -ResourceGroupName $resourceGroup | Where-Object {
+    $_.Properties.provisioningState -eq 'Failed'
+}
 
 if ($failedResources.Count -gt 0) {
     Write-Log "[ERROR] Found failed resources:"
@@ -173,14 +174,14 @@ if ($failedResources.Count -gt 0) {
 }
 
 # Try to get the most recent deployment name (usually named 'main' if using azd)
-$deploymentName = az deployment group list --resource-group $resourceGroup `
-    --query "[?contains(name, 'main')].name" -o tsv
+$deploymentName = (Get-AzResourceGroupDeployment -ResourceGroupName $resourceGroup |
+    Where-Object { $_.DeploymentName -like "*main*" } |
+    Select-Object -First 1).DeploymentName
 
 if ($deploymentName) {
     try {
-        $errorDetails = az deployment group show --resource-group $resourceGroup `
-            --name $deploymentName `
-            --query "properties.error" -o json | ConvertFrom-Json
+        $deployment   = Get-AzResourceGroupDeployment -ResourceGroupName $resourceGroup -Name $deploymentName
+        $errorDetails = $deployment.Properties.Error
 
         if ($errorDetails -ne $null) {
             Write-Log "[ERROR] Deployment error: $($errorDetails.message)"
@@ -199,16 +200,15 @@ if ($deploymentName) {
     Write-Log "No deployment named 'main' found in resource group."
 }
 
-
 azd env set AZURE_RESOURCE_GROUP $resourceGroup | Out-Null
 Write-Log "Set resource group: $resourceGroup"
 
 # === Retry OpenAI provisioning after azd provision ===
 Write-Log "Checking OpenAI provisioning state after provisioning..."
 
-$openAiAccountName = az resource list --resource-group $resourceGroup `
-    --resource-type "Microsoft.CognitiveServices/accounts" `
-    --query "[?contains(name, 'oai0')].name" -o tsv
+$openAiAccountName = (Get-AzResource -ResourceGroupName $resourceGroup -ResourceType "Microsoft.CognitiveServices/accounts" |
+    Where-Object { $_.Name -like "*oai0*" } |
+    Select-Object -First 1).Name
 
 $openAiProvisioningState = ""
 $maxAttempts = 10
@@ -221,10 +221,9 @@ for ($i = 1; $i -le $maxAttempts; $i++) {
     }
 
     try {
-        $openAiProvisioningState = az cognitiveservices account show `
-            --name $openAiAccountName `
-            --resource-group $resourceGroup `
-            --query "provisioningState" -o tsv
+        $openAiProvisioningState = (Get-AzCognitiveServicesAccount `
+            -Name $openAiAccountName `
+            -ResourceGroupName $resourceGroup).ProvisioningState
 
         Write-Log "Post-provision OpenAI provisioning state: $openAiProvisioningState (Attempt $i)"
 
@@ -260,23 +259,22 @@ if ($openAiProvisioningState -ne "Succeeded") {
 }
 
 # Find the Key Vault with a name starting with 'bastionkv'
-$bastionKvName = az resource list --resource-group $resourceGroup `
-    --resource-type "Microsoft.KeyVault/vaults" `
-    --query "[?starts_with(name, 'bastionkv')].name" -o tsv
+$bastionKvName = (Get-AzKeyVault -ResourceGroupName $resourceGroup |
+    Where-Object { $_.VaultName -like "bastionkv*" } |
+    Select-Object -First 1).VaultName
 
 if ($bastionKvName) {
     $bastionKvScope = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.KeyVault/vaults/$bastionKvName"
     $labUserUPN = "User1-$labInstanceId@lodsprodmca.onmicrosoft.com"
 
     try {
-        $labUserObjectId = az ad user show --id $labUserUPN --query id -o tsv
+        $labUserObjectId = (Get-AzADUser -UserPrincipalName $labUserUPN).Id
 
         if ($labUserObjectId) {
-            az role assignment create `
-                --assignee-object-id $labUserObjectId `
-                --assignee-principal-type User `
-                --role "Key Vault Secrets User" `
-                --scope $bastionKvScope | Out-Null
+            New-AzRoleAssignment `
+                -ObjectId $labUserObjectId `
+                -RoleDefinitionName "Key Vault Secrets User" `
+                -Scope $bastionKvScope | Out-Null
 
             Write-Log "Assigned 'Key Vault Secrets User' role to $labUserUPN on $bastionKvName"
         } else {
@@ -291,39 +289,34 @@ if ($bastionKvName) {
 
 # === Assign Search Service Contributor role to lab user ===
 $labUserUPN = "User1-$labInstanceId@lodsprodmca.onmicrosoft.com"
-$labUserObjectId = az ad user show --id $labUserUPN --query id -o tsv
+$labUserObjectId = (Get-AzADUser -UserPrincipalName $labUserUPN).Id
 
-$searchServiceName = az resource list `
-    --resource-group $resourceGroup `
-    --resource-type "Microsoft.Search/searchServices" `
-    --query "[0].name" -o tsv
+$searchServiceName = (Get-AzResource -ResourceGroupName $resourceGroup -ResourceType "Microsoft.Search/searchServices" |
+    Select-Object -First 1).Name
 
 if ($labUserObjectId -and $searchServiceName) {
     $searchScope = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Search/searchServices/$searchServiceName"
 
-    az role assignment create `
-        --assignee-object-id $labUserObjectId `
-        --assignee-principal-type User `
-        --role "Search Service Contributor" `
-        --scope $searchScope | Out-Null
+    New-AzRoleAssignment `
+        -ObjectId $labUserObjectId `
+        -RoleDefinitionName "Search Service Contributor" `
+        -Scope $searchScope | Out-Null
 
     Write-Log "Assigned 'Search Service Contributor' role to $labUserUPN on $searchServiceName"
 } else {
     Write-Log "[ERROR] Could not retrieve lab user object ID or search service name for RBAC assignment."
 }
 
-
 # Retry OpenAI provisioning
-$openAiAccountName = az resource list --resource-group $resourceGroup `
-    --resource-type "Microsoft.CognitiveServices/accounts" `
-    --query "[?contains(name, 'oai0')].name" -o tsv
+$openAiAccountName = (Get-AzResource -ResourceGroupName $resourceGroup -ResourceType "Microsoft.CognitiveServices/accounts" |
+    Where-Object { $_.Name -like "*oai0*" } |
+    Select-Object -First 1).Name
 
 $provisioningState = ""
 if ($openAiAccountName) {
-    $provisioningState = az cognitiveservices account show `
-        --name $openAiAccountName `
-        --resource-group $resourceGroup `
-        --query "provisioningState" -o tsv
+    $provisioningState = (Get-AzCognitiveServicesAccount `
+        -Name $openAiAccountName `
+        -ResourceGroupName $resourceGroup).ProvisioningState
 }
 
 if (-not $openAiAccountName -or $provisioningState -ne "Succeeded") {
@@ -343,54 +336,50 @@ if (-not $openAiAccountName -or $provisioningState -ne "Succeeded") {
         -logFile $logFile
     Write-Log "Retry fallback OpenAI provisioning executed"
 }
-$storageAccount = az resource list --resource-group $resourceGroup `
-    --resource-type "Microsoft.Storage/storageAccounts" `
-    --query "sort_by([?type=='Microsoft.Storage/storageAccounts'], &length(name))[0].name" -o tsv
+
+# Storage account selection (shortest name, same as original sort_by &length(name))
+$storageAccount = (Get-AzStorageAccount -ResourceGroupName $resourceGroup |
+    Sort-Object { $_.StorageAccountName.Length } |
+    Select-Object -First 1).StorageAccountName
 
 # Get the connection string from the storage account
-$storageConnStr = az storage account show-connection-string `
-    --name $storageAccount `
-    --resource-group $resourceGroup `
-    --query connectionString -o tsv
+$storageAccountObj  = Get-AzStorageAccount -ResourceGroupName $resourceGroup -Name $storageAccount
+$storageAccountKeys = Get-AzStorageAccountKey -ResourceGroupName $resourceGroup -Name $storageAccount
+$primaryKey = ($storageAccountKeys | Select-Object -First 1).Value
+$storageConnStr = "DefaultEndpointsProtocol=https;AccountName=$($storageAccountObj.StorageAccountName);AccountKey=$primaryKey;EndpointSuffix=core.windows.net"
 
 # Set it on each Function App (dataIngest and orchestrator)
 if ($ingestionFunc) {
-    az functionapp config appsettings set `
-        --name $ingestionFunc `
-        --resource-group $resourceGroup `
-        --settings AzureWebJobsStorage="$storageConnStr" | Out-Null
+    $appSettings = @{ "AzureWebJobsStorage" = $storageConnStr }
+    Set-AzWebApp -Name $ingestionFunc -ResourceGroupName $resourceGroup -AppSettings $appSettings | Out-Null
     Write-Log "Set AzureWebJobsStorage for $ingestionFunc"
 }
 
 if ($orchestratorFunc) {
-    az functionapp config appsettings set `
-        --name $orchestratorFunc `
-        --resource-group $resourceGroup `
-        --settings AzureWebJobsStorage="$storageConnStr" | Out-Null
+    $appSettings = @{ "AzureWebJobsStorage" = $storageConnStr }
+    Set-AzWebApp -Name $orchestratorFunc -ResourceGroupName $resourceGroup -AppSettings $appSettings | Out-Null
     Write-Log "Set AzureWebJobsStorage for $orchestratorFunc"
 }
 
-$objectId = az ad sp show --id $clientId --query id -o tsv
+$objectId = (Get-AzADServicePrincipal -ApplicationId $clientId).Id
 
-az role assignment create `
-    --assignee-object-id $objectId `
-    --assignee-principal-type ServicePrincipal `
-    --role "Storage Blob Data Contributor" `
-    --scope "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Storage/storageAccounts/$storageAccount" | Out-Null
+New-AzRoleAssignment `
+    -ObjectId $objectId `
+    -RoleDefinitionName "Storage Blob Data Contributor" `
+    -Scope "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Storage/storageAccounts/$storageAccount" | Out-Null
 
 Write-Log "Assigned Storage Blob Data Contributor"
 
 # === Assign RBAC to user on Storage Account ===
 $labUserUPN = "User1-$labInstanceId@lodsprodmca.onmicrosoft.com"
 try {
-    $labUserObjectId = az ad user show --id $labUserUPN --query id -o tsv
+    $labUserObjectId = (Get-AzADUser -UserPrincipalName $labUserUPN).Id
 
     if ($labUserObjectId) {
-        az role assignment create `
-            --assignee-object-id $labUserObjectId `
-            --assignee-principal-type User `
-            --role "Storage Blob Data Contributor" `
-            --scope "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Storage/storageAccounts/$storageAccount" | Out-Null
+        New-AzRoleAssignment `
+            -ObjectId $labUserObjectId `
+            -RoleDefinitionName "Storage Blob Data Contributor" `
+            -Scope "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Storage/storageAccounts/$storageAccount" | Out-Null
 
         Write-Log "Assigned 'Storage Blob Data Contributor' role to $labUserUPN on $storageAccount"
     } else {
@@ -400,29 +389,31 @@ try {
     Write-Log "[ERROR] Failed to assign RBAC on Storage Account: $_"
 }
 
-$ingestionFunc = az resource list --resource-group $resourceGroup `
-    --resource-type "Microsoft.Web/sites" `
-    --query "[?contains(name, 'inges')].name" -o tsv
-$orchestratorFunc = az resource list --resource-group $resourceGroup `
-    --resource-type "Microsoft.Web/sites" `
-    --query "[?contains(name, 'orch')].name" -o tsv
+$ingestionFunc = (Get-AzWebApp -ResourceGroupName $resourceGroup |
+    Where-Object { $_.Name -like "*inges*" } |
+    Select-Object -First 1).Name
+$orchestratorFunc = (Get-AzWebApp -ResourceGroupName $resourceGroup |
+    Where-Object { $_.Name -like "*orch*" } |
+    Select-Object -First 1).Name
 
 if ($ingestionFunc) {
-    az functionapp config appsettings set --name $ingestionFunc --resource-group $resourceGroup --settings MULTIMODAL=true | Out-Null
-    az functionapp restart --name $ingestionFunc --resource-group $resourceGroup | Out-Null
+    $settings = @{ "MULTIMODAL" = "true" }
+    Set-AzWebApp -Name $ingestionFunc -ResourceGroupName $resourceGroup -AppSettings $settings | Out-Null
+    Restart-AzWebApp -Name $ingestionFunc -ResourceGroupName $resourceGroup | Out-Null
 }
 if ($orchestratorFunc) {
-    az functionapp config appsettings set --name $orchestratorFunc --resource-group $resourceGroup --settings AUTOGEN_ORCHESTRATION_STRATEGY=multimodal_rag | Out-Null
-    az functionapp restart --name $orchestratorFunc --resource-group $resourceGroup | Out-Null
+    $settings = @{ "AUTOGEN_ORCHESTRATION_STRATEGY" = "multimodal_rag" }
+    Set-AzWebApp -Name $orchestratorFunc -ResourceGroupName $resourceGroup -AppSettings $settings | Out-Null
+    Restart-AzWebApp -Name $orchestratorFunc -ResourceGroupName $resourceGroup | Out-Null
 }
 Write-Log "Function apps updated"
 
-$webAppName = az resource list --resource-group $resourceGroup `
-    --resource-type "Microsoft.Web/sites" `
-    --query "[?contains(name, 'webgpt')].name" -o tsv
+$webAppName = (Get-AzWebApp -ResourceGroupName $resourceGroup |
+    Where-Object { $_.Name -like "*webgpt*" } |
+    Select-Object -First 1).Name
 
 if ($webAppName) {
-    $webAppUrl = az webapp show --name $webAppName --resource-group $resourceGroup --query "defaultHostName" -o tsv
+    $webAppUrl = (Get-AzWebApp -Name $webAppName -ResourceGroupName $resourceGroup).DefaultHostName
     Write-Log "Deployment URL: https://$webAppUrl"
     Write-Host "Your GPT solution is live at: https://$webAppUrl"
 } else {
